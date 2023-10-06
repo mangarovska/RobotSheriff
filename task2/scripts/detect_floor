@@ -1,0 +1,550 @@
+#!/usr/bin/python3
+
+import sys
+import rospy
+import cv2
+import numpy as np
+import tf
+import tf2_geometry_msgs
+import tf2_ros
+from task2.msg import control
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import PointStamped, Vector3, Pose, PoseStamped, PoseWithCovarianceStamped, Quaternion
+from std_msgs.msg import Int8
+from cv_bridge import CvBridge, CvBridgeError
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA
+import webcolors
+
+class The_Ring:
+    def __init__(self):
+        rospy.init_node('ring_floor', anonymous=True)
+
+        # An object we use for converting images between ROS format and OpenCV format
+        self.bridge = CvBridge()
+
+        # A help variable for holding the dimensions of the image
+        self.dims = (0, 0, 0)
+
+        # Marker array object used for visualizations
+        # self.marker_array = MarkerArray()
+
+        self.marker_num = 1
+        self.begin_flag = False ## __ MARK
+        
+        # Subscribe to the image and/or depth topic
+        self.image_sub = rospy.Subscriber("/arm_camera/rgb/image_raw", Image, self.image_callback)
+        self.status_sub = rospy.Subscriber("/circle_goal/status", Int8, self.set_completed_status)
+
+        self.curr_location = rospy.Subscriber("/amcl_pose", PoseWithCovarianceStamped, self.curr_location_callback)
+        # self.depth_sub = rospy.Subscriber("/camera/depth/image_raw", Image, self.depth_callback)
+
+        # Object we use for transforming between coordinate frames
+        self.tf_buf = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+
+        self.start_time = rospy.Time.now()
+
+        self.begin_operation_sub = rospy.Subscriber("/detect_floor/init", Int8, self.begin_operation_callback)
+
+        self.markers_pub = rospy.Publisher('/ground_circle', Marker, queue_size=10)
+        self.approach_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=20)
+        self.twist_approach_pub = rospy.Publisher('/circle_goal', PoseStamped, queue_size=10)
+        # Following initiate twist_control functions responsible for either moving the robot forward or rotating it.
+        # specifically, second function is only meant for initial spotting of the circle, as that should allow our detect_floor to finally spot the circle
+
+        self.twist_forward_pub = rospy.Publisher('/circle_goal/forward', Int8, queue_size=10)
+        self.twist_angular_pub = rospy.Publisher('/circle_goal/angular', Int8, queue_size=10)
+
+        self.twist_controller_pub = rospy.Publisher('/circle_goal/controller', control, queue_size=10)
+
+        self.pending_marker_list = []
+        self.no_detection = 0
+        self.global_goal = PoseStamped()
+        self.completed_status = True
+        self.detection_mode = True
+        self.forward_init = False
+
+        self.x = 0
+        self.y = 0
+        self.z = 0
+        self.z_ang = 0
+        self.w_ang = 0
+        self.quart = [0, 0, 0, 0]
+
+        self.count_black = 0
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))
+        self.kernel2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+
+        self.allow_black = True
+
+
+    def marker_maker(self, pose, point_world, rgba_list=[255,0,0,1]) :
+        self.marker_num += 1
+        marker = Marker()
+        marker.header.stamp = point_world.header.stamp
+        marker.header.frame_id = point_world.header.frame_id
+        marker.pose = pose
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.frame_locked = False
+        marker.lifetime = rospy.Duration.from_sec(10)
+        marker.id = self.marker_num
+        marker.scale = Vector3(0.2, 0.2, 0.2)
+        marker.color = ColorRGBA(rgba_list[0],rgba_list[1],rgba_list[2],rgba_list[3])
+
+        return marker
+
+    # since this is when we start our program we can initiate twist rotation
+    def begin_operation_callback(self, msg):
+        rospy.sleep(3)
+        send = Int8(1)
+        self.twist_angular_pub.publish(send)
+        if msg.data == 1:
+            self.begin_flag = True
+            # print("Begin operation", self.begin_flag)
+        else:
+            self.begin_flag = False
+            # print("End operation", self.begin_flag)
+
+        self.start_time = rospy.Time.now()
+
+
+    def curr_location_callback(self, msg: PoseWithCovarianceStamped):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        self.z = msg.pose.pose.position.z
+        self.z_ang = msg.pose.pose.orientation.z
+        self.w_ang = msg.pose.pose.orientation.w
+        self.quart = [0, 0, self.z_ang, self.w_ang]
+
+
+    def bgr_2_rgb(self, color_vect):
+        return cv2.cvtColor(np.uint8([[color_vect]]), cv2.COLOR_BGR2RGB)[0][0]
+    
+            
+       
+    def get_pose(self, e, dist):
+        # Calculate the position of the detected ellipse
+
+        k_f = 525 # kinect focal length in pixels
+
+        elipse_x = self.dims[1] / 2 - e[0][0]
+        elipse_y = self.dims[0] / 2 - e[0][1]
+
+        angle_to_target = np.arctan2(elipse_x, k_f)
+
+        # Get the angles in the base_link relative coordinate system
+        x, y = dist*np.cos(angle_to_target), dist*np.sin(angle_to_target)
+
+        ### Define a stamped message for transformation - directly in "base_frame"
+        #point_s = PointStamped()
+        #point_s.point.x = x
+        #point_s.point.y = y
+        #point_s.point.z = 0.3
+        #point_s.header.frame_id = "base_link"
+        #point_s.header.stamp = rospy.Time(0)
+
+        # Define a stamped message for transformation - in the "camera rgb frame"
+        point_s = PointStamped()
+        point_s.point.x = -y
+        point_s.point.y = 0
+        point_s.point.z = x
+        point_s.header.frame_id = "camera_rgb_optical_frame"
+        point_s.header.stamp = rospy.Time(0)
+
+        try:
+        # Get the point in the "map" coordinate system
+            point_world = self.tf_buf.transform(point_s, "map")
+
+            # Create a Pose object with the same position
+            pose = Pose()
+            pose.position.x = point_world.point.x
+            pose.position.y = point_world.point.y
+            pose.position.z = point_world.point.z
+
+        except Exception as e:
+            print(e)
+            pose = None
+
+        return pose, point_world
+
+
+    def append_to_pending(self, loc_vector):
+        # if pending list empty simply add:
+        if len(self.pending_marker_list) == 0:
+            self.pending_marker_list.append(loc_vector)
+            return True
+        else:
+            # check if the marker is close enough to current pending list
+            distance_vect = np.linalg.norm(np.array(self.pending_marker_list) - loc_vector, axis=1)
+            # print(distance_vect)
+            if(distance_vect <= 0.035).all(): ## 0.35, 0.2, 0.15 0.05, 0.04, 0.03 works
+                # if the distance between all components is sufficiently small, add our new marker to the list
+                self.pending_marker_list.append(loc_vector)
+                return True
+            else:
+                # distance between all components is too large, reset our pending list, and return false
+                self.pending_marker_list.clear()
+                return False
+            
+
+    def create_approach_goal(self, marker, z_snap=0, w_snap=0):
+        new_goal = PoseStamped()
+        new_goal.header.stamp = rospy.Time.now();
+        new_goal.header.frame_id = 'map'
+        new_goal.pose.position.x = (marker.pose.position.x)
+        new_goal.pose.position.y = (marker.pose.position.y)
+        # new_goal.pose.position.x = self.x
+        # new_goal.pose.position.y = self.y
+
+        k_f = 525 # kinect focal length in pixels
+
+        current_pos = np.array([self.x, self.y, 0])
+        # current_orientation = np.array([0, 0, self.z_ang, self.w_ang])
+        circle_pos = np.array([marker.pose.position.x, marker.pose.position.y, 0])
+
+        direction_vector = circle_pos - current_pos
+        direction_vector /= np.linalg.norm(direction_vector)
+        # q_desired = tf.transformations.quaternion_from_matrix(tf.transformations.rotation_matrix(direction_vector, [0, 0, 1]))
+        # q_error = tf.transformations.quaternion_multiply(q_desired, tf.transformations.quaternion_inverse(current_orientation))
+        yaw = np.arctan2(direction_vector[1], direction_vector[0])
+        desired_orientation = tf.transformations.quaternion_from_euler(0, 0, yaw)
+        new_goal.pose.orientation.z = desired_orientation[2]
+        new_goal.pose.orientation.w = desired_orientation[3]
+
+        return new_goal
+
+    def create_approach_experimental(self, curr_position):
+        new_goal = PoseStamped()
+        new_goal.header.stamp = rospy.Time.now();
+        new_goal.header.frame_id = 'map'
+        new_goal.pose.position.x = curr_position[0] # current theoretical position of circle
+        new_goal.pose.position.y = curr_position[1]
+        new_goal.pose.position.z = curr_position[2]
+
+        robot_pos = np.array([self.x, self.y, 0])
+
+        direction_vector = curr_position - robot_pos
+        direction_vector /= np.linalg.norm(direction_vector)
+        yaw = np.arctan2(direction_vector[1], direction_vector[0])
+        desired_orientation = tf.transformations.quaternion_from_euler(0, 0, yaw)
+        new_goal.pose.orientation.z = desired_orientation[2]
+        new_goal.pose.orientation.w = desired_orientation[3]
+        return new_goal
+
+
+    def set_completed_status(self, msg):
+        print(f"Completed status received: {msg.data}")
+        self.pending_marker_list.clear()
+        self.completed_status = True if msg.data == 1 else False
+
+
+    def image_callback(self,data):
+        # print('I got a new image!')
+        if self.begin_flag:
+            curr_time = rospy.Time.now()
+            if (curr_time - self.start_time).to_sec() > 40:
+                sys.exit()
+
+            try:
+                cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            except CvBridgeError as e:
+                print(e)
+
+            cv_image = cv_image[0:-40, 0:640]
+            block = cv_image[-95:-75,310:330] # 80, 40 ; 640/2 = 320, [310:330]
+            cv2.imshow("block", block)
+            cv2.waitKey(1)
+
+            block_color = np.mean(block, axis=(0,1))
+            self.dims = cv_image.shape
+            alpha = 1.8  # Contrast control
+            beta = -50 # Brightness control -60 works well for p1
+            adjusted = cv2.convertScaleAbs(cv_image, alpha=alpha, beta=beta)
+            gray = cv2.cvtColor(adjusted, cv2.COLOR_BGR2GRAY)
+
+
+            # Tranform image to gayscale
+            # gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+
+            # Do histogram equlization
+            img = cv2.equalizeHist(gray)
+
+            # Binarize the image, there are different ways to do it
+            # ret, thresh = cv2.threshold(img, 30, 255, cv2.THRESH_BINARY)
+            # ret, thresh = cv2.threshold(img, 5, 255, cv2.THRESH_BINARY)
+            # ret, thresh = cv2.threshold(img, 170, 255, cv2.THRESH_BINARY)
+            thresh = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 25)  #default: 15,25
+            # thresh = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 35, 25)  #default: 15,25
+
+            cv2.imshow("thresh", thresh)
+            cv2.waitKey(1)
+
+            # test0 = cv2.dilate(thresh, self.kernel, iterations = 1)
+            # cv2.imshow("test0", test0)
+            # cv2.waitKey(1)
+            # test1 = cv2.erode(thresh, self.kernel2, iterations = 2)
+            # cv2.imshow("test1", test1)
+            # cv2.waitKey(1)
+
+
+            # test2 = cv2.morphologyEx(test1, cv2.MORPH_CLOSE, self.kernel2)
+
+            # cv2.imshow("test2", test2)
+            # cv2.waitKey(1)
+
+
+
+            # Extract contours
+            # contours, hierarchy = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # contours, hierarchy = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_L1)
+            contours, hierarchy = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
+            # circles = cv2.HoughCircles(thresh, cv2.HOUGH_GRADIENT, 1, minDist=40, param1=50, param2=30, minRadius=200, maxRadius=240)
+
+            # cv_cp = cv_image.copy()
+            # if circles is not None:
+            #     circles = np.round(circles[0, :]).astype('int')
+            #     for (x, y, r) in circles:
+            #         cv2.circle(cv_cp, (x, y), r, (0, 0, 255), 2)
+            # cv2.imshow("circles", cv_cp)
+            # cv2.waitKey(1)
+
+
+            # Fit elipses to all extracted contours
+            elps = []
+            for cnt in contours:
+                #     print cnt
+                #     print cnt.shape
+                if cnt.shape[0] >= 20:
+                    ellipse = cv2.fitEllipse(cnt)
+                    elps.append(ellipse)
+
+            # print(elps[0])
+            
+            # Find two elipses with same centers
+            candidates = []
+            for n in range(len(elps)):
+                e1 = elps[n]
+                # if e1[0][0] < 200: continue
+                for m in range(n + 1, len(elps)):
+                    e2 = elps[m]
+                    # if e2[0][0] < 200: continue
+
+                    dist = np.sqrt(((e1[0][0] - e2[0][0]) ** 2 + (e1[0][1] - e2[0][1]) ** 2))
+                    e1_shape = np.array(e1[1])
+                    e2_shape = np.array(e2[1])
+
+                    e1_aspect_ratio = e1_shape.max() / (e1_shape.min()+1)
+                    e2_aspect_ratio = e2_shape.max() / (e2_shape.min()+1)
+
+                    aspect_ratio_diff = abs(e1_aspect_ratio - e2_aspect_ratio)
+
+                    # print("aspect ratio e1: ", e1_aspect_ratio, "aspect ratio e2: ", e2_aspect_ratio, "aspect ratio diff: ", aspect_ratio_diff)
+                    #             print dist
+                    if dist < 5:  # and aspect_ratio_diff < 0.3:  # e1_aspect_ratio < 1.4 and e2_aspect_ratio < 1.4
+                        candidates.append((e1,e2))
+
+            # print("Processing is done! found", len(candidates), "candidates for rings")
+
+            try:
+                depth_img = rospy.wait_for_message('/arm_camera/depth/image_raw', Image)   
+            except Exception as e:
+                print(e)
+
+            # test1, test2 = candidates[0]
+            # print(test1)
+            # Extract the depth from the depth image
+            ring_flag = False
+            for c in candidates:
+                # print(c[0])
+
+                # the centers of the ellipses
+                e1, e2 = c
+                # print(e1, e2)
+                el1 = np.array(e1[1])
+                el2 = np.array(e2[1])
+                e1_aspect_ratio = el1.max() / el1.min()
+                e2_aspect_ratio = el2.max() / el2.min()
+
+                aspect_ratio_diff = abs(e1_aspect_ratio - e2_aspect_ratio)
+
+                # print("aspect ratio e1: ", e1_aspect_ratio, "aspect ratio e2: ", e2_aspect_ratio, "aspect ratio diff: ", aspect_ratio_diff)
+
+                # if (cv_image[0][1] == )
+
+                # drawing the ellipses on the image
+                # delay until you are certain it's a good detection
+                # cv_copy = cv_image.copy()
+                # cv2.ellipse(cv_copy, e1, (0, 0, 0), 2)
+                # cv2.ellipse(cv_copy, e2, (0, 0, 0), 2)
+                # cv2.imshow("candidates", cv_copy)
+                # cv2.waitKey(1)
+
+                size = (e1[1][0] + e1[1][1])/2
+                center = (e1[0][1], e1[0][0])
+
+                x1 = int(center[0] - size / 2)
+                x2 = int(center[0] + size / 2)
+                x_min = x1 if x1>0 else 0
+                x_max = x2 if x2<cv_image.shape[0] else cv_image.shape[0]
+
+                y1 = int(center[1] - size / 2)
+                y2 = int(center[1] + size / 2)
+                y_min = y1 if y1 > 0 else 0
+                y_max = y2 if y2 < cv_image.shape[1] else cv_image.shape[1]
+
+                depth_image = self.bridge.imgmsg_to_cv2(depth_img, "passthrough")
+
+                # if center distance is presumed to be 0, or some variation of nan
+                # the ring has a hole, therefore it's indeed a 3d ring.
+                center_idx = np.rint(center).astype(int)
+                # print("center dist: ", depth_image[center_idx[0], center_idx[1]])
+
+                # another guarantee:
+                # print("Center pixel bgr value: ", cv_image[center_idx[0], center_idx[1]])
+                # color_vect =  cv_image[center_idx[0], center_idx[1]]
+
+
+                # masked_depth = np.ma.masked_equal(depth_image[x_min:x_max,y_min:y_max], 0)
+                """
+                * The depth image is a single-channel float32 image, in meters.
+                * it's a diagonal value 95% of the time, so subtract the y component:
+                ~ 0.63²
+                """
+                ring_dist= float(np.nanmean(depth_image[x_min:x_max,y_min:y_max]))
+                print(f"Distance to ring : {ring_dist}")
+                cv2.imshow("Extrapolated", cv_image[x_min:x_max,y_min:y_max])
+                cv2.waitKey(1)
+
+
+                
+                true_ring = True # 255+255+255 = 765
+                """
+                - Only after the if statement are we certain that it's a proper detection,
+                - finally we can start manipulating elements as intended.
+                """
+                if true_ring and ring_dist < 3.0:  # ring_dist defines how far away the acceptable ring can be detected
+                    ring_flag = True
+                    copy = cv_image.copy()
+                    cv2.ellipse(copy, e1, (0, 255, 0), 2)
+                    cv2.ellipse(copy, e2, (0, 255, 0), 2)
+                    # color_vect =  cv_image[center_idx[0], center_idx[1]]
+
+
+                    # cv2.imshow("Circle excerpt", image_excerpt)
+                    # cv2.waitKey(0)
+                    pose_temp, point_world = self.get_pose(e1, ring_dist) ##/2.3)
+
+                    # firstly, if the pending_marker_list is empty, we can just add the marker to the list
+                    curr_pose_vector = np.array([pose_temp.position.x, pose_temp.position.y, pose_temp.position.z])
+                    
+                    # print(self.append_to_pending(curr_pose_vector)) ## true or false print, but need function call
+                    self.append_to_pending(curr_pose_vector)
+
+                    ## Try improving code by adding mean orientation specifier as well
+                    # we have enough detections, so we can add the marker to the marker_list
+                    if(len(self.pending_marker_list) >= 8) and self.no_detection < 10 and self.detection_mode:
+                        send = control()
+                        send.control_number = 0
+                        send.movement_type = "angular"
+                        self.twist_controller_pub.publish(send)
+                        
+                        if (self.no_detection == 0):
+                            mean_loc = np.mean(np.array(self.pending_marker_list), axis=0)
+                            print("mean_loc: ", mean_loc)
+                            print(f"self.x: {self.x}, self.y: {self.y}, self.z_ang: {self.z_ang}, self.w_ang: {self.w_ang}")
+                            ideal_pose = Pose()
+                            ideal_pose.position.x = mean_loc[0]
+                            ideal_pose.position.y = mean_loc[1]
+                            ideal_pose.position.z = mean_loc[2]
+                            ## mean position of target circle. Create marker
+                            mark = self.marker_maker(ideal_pose, point_world)
+                            self.markers_pub.publish(mark)
+                            goal = self.create_approach_goal(mark, 0, 0)
+                            print("Current pose vector: ", curr_pose_vector)
+                            # goal = self.create_approach_experimental(curr_pose_vector)
+                            self.global_goal = goal
+                            print("Global goal: ", self.global_goal)
+                            # print("Approaching marker:\n", mark.pose.position)
+
+
+                        self.no_detection += 1
+
+                        print(f"Wanted angle:\n\t z:{self.global_goal.pose.orientation.z},\n\t w:{self.global_goal.pose.orientation.w}")
+
+                        # self.approach_pub.publish(goal)
+                        print("Publishing goal: ", self.global_goal.pose.position)
+                        self.pending_marker_list.clear()
+                        ## experimental
+                        self.twist_approach_pub.publish(self.global_goal)
+                        self.detection_mode = False
+                        self.completed_status = False
+
+                # self.markers_pub.publish(self.marker_array)
+            # if candidates is None:
+
+
+            if (self.detection_mode is False and self.completed_status is True):
+                print("hihihaha")
+                # print("y_max - y_min: ", y_max - y_min)
+                # print("x_max - x_min: ", x_max - x_min 
+                if (self.forward_init is False): ## init forward movement
+                    send = Int8(1)
+                    self.twist_forward_pub.publish(send)
+                    self.forward_init = True
+                
+
+                # if(self.forward_init is true)
+                # block_color = np.mean(block, axis=(0,1))
+                print("Block color: ", block_color)
+
+                if ((block_color < 75).all() and self.allow_black is True): # hit black
+                    self.allow_black = False
+                    self.count_black += 1
+                
+                if(block_color >= 168).all(): # we hit paper (used to be white, now is grey paper) # old grey 184
+                    if (self.count_black < 1): self.count_black = 1
+                    self.allow_black = True
+
+                if (self.count_black < 2):
+                    # send = Int8(1)
+                    send = control()
+                    send.movement_type = "forward"
+                    send.control_number = 1
+                    print("Sending CONTINUE: ", control)
+                    self.twist_controller_pub.publish(send)
+                else:
+                    # send = Int8(0)
+                    send = control()
+                    send.movement_type = "forward"
+                    send.control_number = 0
+                    print("Sending STOP: ", control)
+                    self.twist_controller_pub.publish(send)
+                print("Count black: ", self.count_black)
+                print("Allow black: ", self.allow_black)
+                print("")
+                    
+            if len(candidates)>0 and ring_flag:
+                # print("Confirmed markers: ", self.confirmed_marker_list)
+                print("Pending markers: ", len(self.pending_marker_list))
+                cv2.imshow("Image window", copy)
+                cv2.waitKey(1)
+
+        # print(f"OUT IF: self.x: {self.x}, self.y: {self.y}, self.z_ang: {self.z_ang}, self.w_ang: {self.w_ang}")
+
+
+def main():
+
+    ring_finder = The_Ring()
+
+    try:
+        rospy.spin()
+    except KeyboardInterrupt:
+        print("Shutting down")
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()

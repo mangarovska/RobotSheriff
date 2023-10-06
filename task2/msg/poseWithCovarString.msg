@@ -1,0 +1,2 @@
+geometry_msgs/PoseStamped pose_msg
+string additional_info
