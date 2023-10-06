@@ -1,2 +1,0 @@
-string movement_type
-int8 control_number

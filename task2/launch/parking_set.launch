@@ -1,9 +1,0 @@
-<?xml version="1.0"?>
-<launch>
-    <node pkg="task2" type="move_arm.py" name="move_arm"></node>
-
-    <node pkg="task2" type="twist_control" name="twist_control"></node>
-
-    <node pkg="task2" type="detect_floor" name="detect_floor"></node>
-
-</launch>
